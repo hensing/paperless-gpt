@@ -440,8 +440,16 @@ func (app *App) analyzeDocumentsHandler(c *gin.Context) {
 		documents = append(documents, doc)
 	}
 
+	// Create a new template from the prompt string in the request
+	tmpl, err := template.New("adhoc-analysis").Funcs(sprig.FuncMap()).Parse(req.Prompt)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid prompt template"})
+		log.Errorf("Invalid prompt template: %v", err)
+		return
+	}
+
 	var promptBuffer bytes.Buffer
-	err := adhocAnalysisTemplate.Execute(&promptBuffer, map[string]interface{}{
+	err = tmpl.Execute(&promptBuffer, map[string]interface{}{
 		"Documents": documents,
 		"Language":  getLikelyLanguage(),
 	})

@@ -7,6 +7,7 @@ const AdhocAnalysis: React.FC = () => {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [selectedDocuments, setSelectedDocuments] = useState<number[]>([]);
   const [prompt, setPrompt] = useState('');
+  const [originalPrompt, setOriginalPrompt] = useState('');
   const [analysisResult, setAnalysisResult] = useState('');
   const [error, setError] = useState('');
   const [processing, setProcessing] = useState(false);
@@ -27,7 +28,9 @@ const AdhocAnalysis: React.FC = () => {
   const fetchPromptTemplate = async () => {
     try {
       const res = await axios.get<{[key: string]: string}>('./api/prompts');
-      setPrompt(res.data['adhoc-analysis-prompt.tmpl'] || '');
+      const defaultPrompt = res.data['adhoc-analysis-prompt.tmpl'] || '';
+      setPrompt(defaultPrompt);
+      setOriginalPrompt(defaultPrompt);
     } catch (err) {
       console.error(err);
     }
@@ -104,7 +107,13 @@ const AdhocAnalysis: React.FC = () => {
         />
       </div>
 
-      <div className="mb-6 flex justify-end">
+      <div className="mb-6 flex justify-end items-center space-x-4">
+        <button
+          onClick={() => setPrompt(originalPrompt)}
+          className="bg-gray-300 dark:bg-gray-600 px-4 py-2 rounded hover:bg-gray-400 dark:hover:bg-gray-500"
+        >
+          Reset to Default
+        </button>
         <button
           onClick={handleStartAnalysis}
           disabled={processing || selectedDocuments.length === 0}
