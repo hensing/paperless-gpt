@@ -6,16 +6,21 @@ import (
 	"encoding/base64"
 	"fmt"
 	"image"
+	"net/http"
 	"os"
+	"paperless-gpt/internal/textsanitize"
 	"strings"
 
 	_ "image/jpeg"
 
+	"github.com/gabriel-vasile/mimetype"
 	"github.com/sirupsen/logrus"
 	"github.com/tmc/langchaingo/llms"
+	"github.com/tmc/langchaingo/llms/anthropic"
 	"github.com/tmc/langchaingo/llms/mistral"
 	"github.com/tmc/langchaingo/llms/ollama"
 	"github.com/tmc/langchaingo/llms/openai"
+	"paperless-gpt/sanitize"
 )
 
 // LLMProvider implements OCR using LLM vision models
@@ -27,6 +32,19 @@ type LLMProvider struct {
 	maxTokens   int
 	temperature *float64
 	ollamaTopK  *int
+}
+
+// WithPrompt returns a shallow copy of the provider with a different prompt.
+// This enables per-document prompt rendering without mutating shared state.
+func (p *LLMProvider) WithPrompt(prompt string) *LLMProvider {
+	clone := *p
+	clone.prompt = prompt
+	return &clone
+}
+
+// GetPrompt returns the current OCR prompt.
+func (p *LLMProvider) GetPrompt() string {
+	return p.prompt
 }
 
 func newLLMProvider(config Config) (*LLMProvider, error) {
@@ -49,6 +67,12 @@ func newLLMProvider(config Config) (*LLMProvider, error) {
 	case "mistral":
 		logger.Debug("Initializing Mistral vision model")
 		model, err = createMistralClient(config)
+	case "anthropic":
+		logger.Debug("Initializing Anthropic vision model")
+		model, err = createAnthropicClient(config)
+	case "googleai":
+		logger.Debug("Initializing Google AI vision model")
+		model, err = NewGoogleAIProvider(context.Background(), config.VisionLLMModel, config.GoogleAIAPIKey, config.GoogleAIThinkingBudget)
 	default:
 		return nil, fmt.Errorf("unsupported vision LLM provider: %s", config.VisionLLMProvider)
 	}
@@ -78,36 +102,56 @@ func (p *LLMProvider) ProcessImage(ctx context.Context, imageContent []byte, pag
 	})
 	logger.Debug("Starting LLM OCR processing")
 
-	// Log the image dimensions
-	img, _, err := image.Decode(bytes.NewReader(imageContent))
-	if err != nil {
-		logger.WithError(err).Error("Failed to decode image")
-		return nil, fmt.Errorf("error decoding image: %w", err)
-	}
-	bounds := img.Bounds()
-	logger.WithFields(logrus.Fields{
-		"width":  bounds.Dx(),
-		"height": bounds.Dy(),
-	}).Debug("Image dimensions")
+	// Detect the content type to handle PDFs differently
+	mtype := mimetype.Detect(imageContent)
+	contentType := mtype.String()
+	isPDF := contentType == "application/pdf"
+	providerName := strings.ToLower(p.provider)
 
-	logger.Debugf("Prompt: %s", p.prompt)
+	logger.WithField("content_type", contentType).Debug("Detected content type")
+
+	if isPDF {
+		logger.WithField("pdf_size", len(imageContent)).Debug("Processing PDF content")
+	} else {
+		// Log image dimensions for image content
+		img, _, err := image.Decode(bytes.NewReader(imageContent))
+		if err != nil {
+			logger.WithError(err).Error("Failed to decode image")
+			return nil, fmt.Errorf("error decoding image: %w", err)
+		}
+		bounds := img.Bounds()
+		logger.WithFields(logrus.Fields{
+			"width":  bounds.Dx(),
+			"height": bounds.Dy(),
+		}).Debug("Image dimensions")
+	}
+
+	logger.Debugf("Prompt length: %d", len(p.prompt))
 
 	// Prepare content parts based on provider type
 	var parts []llms.ContentPart
-	var imagePart llms.ContentPart
-	providerName := strings.ToLower(p.provider)
+	var contentPart llms.ContentPart
 
 	if providerName == "openai" || providerName == "mistral" {
 		logger.Info("Using OpenAI image format")
-		imagePart = llms.ImageURLPart("data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(imageContent))
+		contentPart = llms.ImageURLPart("data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(imageContent))
+	} else if providerName == "googleai" {
+		// GoogleAI supports both images and PDFs via BinaryPart
+		if isPDF {
+			logger.Info("Using GoogleAI PDF format")
+			contentPart = llms.BinaryPart("application/pdf", imageContent)
+		} else {
+			logger.Info("Using GoogleAI image format")
+			contentPart = llms.BinaryPart("image/jpeg", imageContent)
+		}
 	} else {
 		logger.Info("Using binary image format")
-		imagePart = llms.BinaryPart("image/jpeg", imageContent)
+		contentPart = llms.BinaryPart("image/jpeg", imageContent)
 	}
 
 	parts = []llms.ContentPart{
-		imagePart,
-		llms.TextPart(p.prompt),
+		contentPart,
+		llms.TextPart(sanitize.Sanitize(p.prompt)),
 	}
 
 	var callOpts []llms.CallOption
@@ -134,7 +178,7 @@ func (p *LLMProvider) ProcessImage(ctx context.Context, imageContent []byte, pag
 		return nil, fmt.Errorf("error getting response from LLM: %w", err)
 	}
 
-	text := stripReasoning(completion.Choices[0].Content)
+	text := textsanitize.StripReasoning(completion.Choices[0].Content)
 	limitHit := false
 	tokenCount := -1
 
@@ -180,6 +224,44 @@ func createOpenAIClient(config Config) (llms.Model, error) {
 	)
 }
 
+// OllamaHTTPClient returns an *http.Client with headers from OLLAMA_HEADERS injected,
+// or nil if OLLAMA_HEADERS is not set.
+func OllamaHTTPClient() *http.Client {
+	raw := os.Getenv("OLLAMA_HEADERS")
+	if raw == "" {
+		return nil
+	}
+	headers := map[string]string{}
+	for _, pair := range strings.Split(raw, ",") {
+		parts := strings.SplitN(strings.TrimSpace(pair), "=", 2)
+		if len(parts) == 2 && parts[0] != "" {
+			headers[parts[0]] = parts[1]
+		}
+	}
+	if len(headers) == 0 {
+		return nil
+	}
+	return &http.Client{
+		Transport: &ollamaHeaderTransport{
+			base:    http.DefaultTransport,
+			headers: headers,
+		},
+	}
+}
+
+type ollamaHeaderTransport struct {
+	base    http.RoundTripper
+	headers map[string]string
+}
+
+func (t *ollamaHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	for k, v := range t.headers {
+		req.Header.Set(k, v)
+	}
+	return t.base.RoundTrip(req)
+}
+
 // createOllamaClient creates a new Ollama vision model client
 func createOllamaClient(config Config) (llms.Model, error) {
 	host := os.Getenv("OLLAMA_HOST")
@@ -193,6 +275,9 @@ func createOllamaClient(config Config) (llms.Model, error) {
 	if config.OllamaContextLength > 0 {
 		opts = append(opts, ollama.WithRunnerNumCtx(config.OllamaContextLength))
 	}
+	if client := OllamaHTTPClient(); client != nil {
+		opts = append(opts, ollama.WithHTTPClient(client))
+	}
 	return ollama.New(opts...)
 }
 
@@ -205,5 +290,17 @@ func createMistralClient(config Config) (llms.Model, error) {
 	return mistral.New(
 		mistral.WithModel(config.VisionLLMModel),
 		mistral.WithAPIKey(apiKey),
+	)
+}
+
+// createAnthropicClient creates a new Anthropic vision model client
+func createAnthropicClient(config Config) (llms.Model, error) {
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		return nil, fmt.Errorf("Anthropic API key is not set")
+	}
+	return anthropic.New(
+		anthropic.WithModel(config.VisionLLMModel),
+		anthropic.WithToken(apiKey),
 	)
 }

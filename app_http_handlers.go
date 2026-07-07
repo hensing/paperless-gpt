@@ -1,8 +1,8 @@
 package main
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +13,8 @@ import (
 	"strings"
 	"text/template"
 	"time"
+
+	"paperless-gpt/sanitize"
 
 	"github.com/Masterminds/sprig/v3"
 	"github.com/gin-gonic/gin"
@@ -167,7 +169,7 @@ func (app *App) getCustomFieldsHandler(c *gin.Context) {
 func (app *App) documentsHandler(c *gin.Context) {
 	ctx := c.Request.Context()
 
-	documents, err := app.Client.GetDocumentsByTags(ctx, []string{manualTag}, 25)
+	documents, err := app.Client.GetDocumentsByTag(ctx, manualTag, 25)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Error fetching documents: %v", err)})
 		log.Errorf("Error fetching documents: %v", err)
@@ -606,6 +608,7 @@ func (app *App) analyzeDocumentsHandler(c *gin.Context) {
 			log.Errorf("Error fetching document %d: %v", docID, err)
 			return
 		}
+		doc.Content = sanitize.Sanitize(doc.Content)
 		documents = append(documents, doc)
 	}
 
@@ -639,6 +642,15 @@ func (app *App) analyzeDocumentsHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"result": llmResponse})
+}
+
+// getVersionHandler handles the GET /api/version endpoint
+func getVersionHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"version":   version,
+		"commit":    commit,
+		"buildDate": buildDate,
+	})
 }
 
 // containsDotDot checks if a string contains ".." to prevent path traversal.

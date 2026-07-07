@@ -13,17 +13,13 @@ test.beforeAll(async () => {
 });
 
 test.afterAll(async () => {
-  await testEnv.cleanup();
+  await testEnv?.cleanup();
 });
 
 test.beforeEach(async ({ page: testPage }) => {
   page = testPage;
   await page.goto(`http://localhost:${testEnv.paperlessGpt.getMappedPort(PORTS.paperlessGpt)}`);
   await page.screenshot({ path: 'test-results/initial-state.png' });
-});
-
-test.afterEach(async () => {
-  await page.close();
 });
 
 test('should process document and show changes in history', async () => {

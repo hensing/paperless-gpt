@@ -1,5 +1,5 @@
 import axios from "axios";
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import "react-tag-autocomplete/example/src/styles.css"; // Ensure styles are loaded
 import DocumentsToProcess from "./components/DocumentsToProcess";
 import NoDocuments from "./components/NoDocuments";
@@ -20,6 +20,7 @@ export interface GenerateSuggestionsRequest {
   generate_titles?: boolean;
   generate_tags?: boolean;
   generate_correspondents?: boolean;
+  generate_document_types?: boolean;
   generate_created_date?: boolean;
   generate_custom_fields?: boolean;
   selected_custom_field_ids?: number[];
@@ -40,6 +41,7 @@ export interface DocumentSuggestion {
   suggested_tags?: string[];
   suggested_content?: string;
   suggested_correspondent?: string;
+  suggested_document_type?: string;
   suggested_created_date?: string;
   suggested_custom_fields?: CustomFieldSuggestion[];
 }
@@ -68,9 +70,11 @@ const DocumentProcessor: React.FC = () => {
   const [generateTitles, setGenerateTitles] = useState(true);
   const [generateTags, setGenerateTags] = useState(true);
   const [generateCorrespondents, setGenerateCorrespondents] = useState(true);
+  const [generateDocumentTypes, setGenerateDocumentTypes] = useState(true);
   const [generateCreatedDate, setGenerateCreatedDate] = useState(true);
   const [generateCustomFields, setGenerateCustomFields] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const pollingDocumentsRef = useRef(false);
 
   // Custom hook to fetch initial data
   const fetchInitialData = useCallback(async () => {
@@ -111,6 +115,7 @@ const DocumentProcessor: React.FC = () => {
         generate_titles: generateTitles,
         generate_tags: generateTags,
         generate_correspondents: generateCorrespondents,
+        generate_document_types: generateDocumentTypes,
         generate_created_date: generateCreatedDate,
         generate_custom_fields: generateCustomFields,
       };
@@ -222,6 +227,14 @@ const DocumentProcessor: React.FC = () => {
     );
   }
 
+  const handleDocumentTypeChange = (docId: number, documentType: string) => {
+    setSuggestions((prevSuggestions) =>
+      prevSuggestions.map((doc) =>
+        doc.id === docId ? { ...doc, suggested_document_type: documentType } : doc
+      )
+    );
+  }
+
   const handleCreatedDateChange = (docId: number, createdDate: string) => {
     setSuggestions((prevSuggestions) =>
       prevSuggestions.map((doc) =>
@@ -251,6 +264,11 @@ const DocumentProcessor: React.FC = () => {
   useEffect(() => {
     if (documents.length === 0) {
       const interval = setInterval(async () => {
+        if (pollingDocumentsRef.current) {
+          return;
+        }
+
+        pollingDocumentsRef.current = true;
         setError(null);
         try {
           const { data } = await axios.get<Document[]>("./api/documents");
@@ -258,8 +276,10 @@ const DocumentProcessor: React.FC = () => {
         } catch (err) {
           console.error("Error reloading documents:", err);
           setError("Failed to reload documents.");
+        } finally {
+          pollingDocumentsRef.current = false;
         }
-      }, 500);
+      }, 5000);
       return () => clearInterval(interval);
     }
   }, [documents]);
@@ -345,6 +365,15 @@ const DocumentProcessor: React.FC = () => {
             <label className="flex items-center space-x-2">
               <input
                 type="checkbox"
+                checked={generateDocumentTypes}
+                onChange={(e) => setGenerateDocumentTypes(e.target.checked)}
+                className="dark:bg-gray-700 dark:border-gray-600"
+              />
+              <span className="text-gray-700 dark:text-gray-200">Generate Document Types</span>
+            </label>
+            <label className="flex items-center space-x-2">
+              <input
+                type="checkbox"
                 checked={generateCreatedDate}
                 onChange={(e) => setGenerateCreatedDate(e.target.checked)}
                 className="dark:bg-gray-700 dark:border-gray-600"
@@ -370,6 +399,7 @@ const DocumentProcessor: React.FC = () => {
           onTagAddition={handleTagAddition}
           onTagDeletion={handleTagDeletion}
           onCorrespondentChange={handleCorrespondentChange}
+          onDocumentTypeChange={handleDocumentTypeChange}
           onCreatedDateChange={handleCreatedDateChange}
           onCustomFieldSuggestionToggle={handleCustomFieldSuggestionToggle}
           onBack={resetSuggestions}

@@ -15,12 +15,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/disintegration/imaging"
 	"github.com/gen2brain/go-fitz"
@@ -39,10 +39,20 @@ type PaperlessClient struct {
 }
 
 // CustomField represents a custom field from the Paperless-ngx API
+type SelectOption struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+
+type CustomFieldExtraData struct {
+	SelectOptions []SelectOption `json:"select_options"`
+}
+
 type CustomField struct {
-	ID       int    `json:"id"`
-	Name     string `json:"name"`
-	DataType string `json:"data_type"`
+	ID        int                   `json:"id"`
+	Name      string                `json:"name"`
+	DataType  string                `json:"data_type"`
+	ExtraData *CustomFieldExtraData `json:"extra_data"`
 }
 
 // DocumentType represents a document type from the Paperless-ngx API
@@ -217,18 +227,55 @@ func (client *PaperlessClient) GetAllTags(ctx context.Context) (map[string]int, 
 	return tagIDMapping, nil
 }
 
-// GetDocumentsByTags retrieves documents that match the specified tags
-func (client *PaperlessClient) GetDocumentsByTags(ctx context.Context, tags []string, pageSize int) ([]Document, error) {
-	tagQueries := make([]string, len(tags))
-	for i, tag := range tags {
-		tagQueries[i] = fmt.Sprintf("tags__name__iexact=%s", tag)
-	}
-	searchQuery := strings.Join(tagQueries, "&")
-	path := fmt.Sprintf("api/documents/?%s&page_size=%d", urlEncode(searchQuery), pageSize)
+// GetDocumentCountByTag checks if there is a document for the specified tag (it is much faster than api/documents/)
+func (client *PaperlessClient) GetDocumentCountByTag(ctx context.Context, tag string) (int, error) {
+	path := fmt.Sprintf("api/tags/?name__iexact=%s", url.QueryEscape(tag))
 
 	resp, err := client.Do(ctx, "GET", path, nil)
 	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed in GetDocumentsByTags: %w", err)
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("error fetching tags: %d, %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var tagsResponse struct {
+		Results []struct {
+			DocumentCount int `json:"document_count"`
+		} `json:"results"`
+		Count int `json:"count"`
+	}
+
+	err = json.NewDecoder(resp.Body).Decode(&tagsResponse)
+	if err != nil {
+		return 0, err
+	}
+
+	if tagsResponse.Count == 0 {
+		return 0, nil
+	}
+
+	return tagsResponse.Results[0].DocumentCount, nil
+}
+
+// GetDocumentsByTag retrieves documents that match the specified tag
+func (client *PaperlessClient) GetDocumentsByTag(ctx context.Context, tag string, pageSize int) ([]Document, error) {
+	documentCount, err := client.GetDocumentCountByTag(ctx, tag)
+	if err != nil {
+		return nil, fmt.Errorf("error checking document count for tag %s: %w", tag, err)
+	}
+	if documentCount == 0 {
+		return []Document{}, nil
+	}
+
+	path := fmt.Sprintf("api/documents/?tags__name__iexact=%s&page_size=%d", url.QueryEscape(tag), pageSize)
+
+	resp, err := client.Do(ctx, "GET", path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request failed in GetDocumentsByTag: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -244,7 +291,7 @@ func (client *PaperlessClient) GetDocumentsByTags(ctx context.Context, tags []st
 			"path":        path,
 			"response":    string(bodyBytes),
 			"headers":     resp.Header,
-		}).Error("Error response from server in GetDocumentsByTags")
+		}).Error("Error response from server in GetDocumentsByTag")
 		return nil, fmt.Errorf("error searching documents: status=%d, body=%s", resp.StatusCode, string(bodyBytes))
 	}
 
@@ -254,7 +301,7 @@ func (client *PaperlessClient) GetDocumentsByTags(ctx context.Context, tags []st
 		log.WithFields(logrus.Fields{
 			"response_body": string(bodyBytes),
 			"error":         err,
-		}).Error("Failed to parse JSON response in GetDocumentsByTags")
+		}).Error("Failed to parse JSON response in GetDocumentsByTag")
 		return nil, fmt.Errorf("failed to parse JSON response: %w", err)
 	}
 
@@ -424,11 +471,52 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 		return fmt.Errorf("error fetching available correspondents: %w", err)
 	}
 
+	// Build document type name -> ID map
+	documentTypes, err := client.GetAllDocumentTypes(ctx)
+	if err != nil {
+		return fmt.Errorf("error fetching available document types: %w", err)
+	}
+	availableDocumentTypes := make(map[string]int)
+	for _, dt := range documentTypes {
+		availableDocumentTypes[dt.Name] = dt.ID
+	}
+
+	// Build a field-id -> data_type map once per call, lazily — only fetch
+	// when at least one document has suggested custom fields, so users who
+	// don't use the feature pay nothing. Used to normalize monetary values
+	// at the API boundary so paperless-ngx's validator accepts them
+	// (see normalize_monetary.go).
+	var customFieldTypes map[int]string
+	for _, d := range documents {
+		if len(d.SuggestedCustomFields) > 0 {
+			allFields, err := client.GetCustomFields(ctx)
+			if err != nil {
+				return fmt.Errorf("error fetching custom fields for normalization: %w", err)
+			}
+			customFieldTypes = make(map[int]string, len(allFields))
+			for _, f := range allFields {
+				customFieldTypes[f.ID] = f.DataType
+			}
+			break
+		}
+	}
+
+	// firstPartial captures the first document in the batch whose update only
+	// succeeded after paperless-gpt had to drop some fields rejected by
+	// paperless-ngx. If non-nil at the end of the function, the caller sees a
+	// PartialUpdateError and applies the fail tag.
+	// Single-document calls (which are the normal usage from background.go)
+	// only ever see the result for that one document; multi-document calls
+	// report on the first one that had drops, matching the existing
+	// stop-on-first-failure semantics for hard errors.
+	var firstPartial *PartialUpdateError
+
 	for _, document := range documents {
 		documentID := document.ID
 		originalDoc := document.OriginalDocument
 		updatedFields := make(map[string]interface{})
 		originalFields := make(map[string]interface{})
+		var partialDroppedFields []string
 
 		// --- TAGS ---
 		finalTagNames := originalDoc.Tags
@@ -454,31 +542,35 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 		}
 		finalTagNames = cleanedTags
 
-		// Always remove auto/manual tags from the final tag list
-		var tagsWithoutAutoManual []string
-		for _, tagName := range finalTagNames {
-			if !strings.EqualFold(tagName, autoTag) && !strings.EqualFold(tagName, manualTag) {
-				tagsWithoutAutoManual = append(tagsWithoutAutoManual, tagName)
-			}
-		}
-		finalTagNames = tagsWithoutAutoManual
-
 		slices.Sort(finalTagNames)
 		finalTagNames = slices.Compact(finalTagNames)
 
+		log.Debugf("Document %d: Final tag names after compacting: %v", documentID, finalTagNames)
+
+		// NOTE: this will dump the OCR complete tag if it doesn't exist in paperless-ngx
 		if !hasSameTags(originalDoc.Tags, finalTagNames) {
-			var newTagIDs []int
+			var finalTagIDs []int
 			for _, tagName := range finalTagNames {
 				if tagID, exists := availableTags[tagName]; exists {
-					newTagIDs = append(newTagIDs, tagID)
+					finalTagIDs = append(finalTagIDs, tagID)
+				} else if createNewTags {
+					// Create the new tag in paperless-ngx
+					newTagID, err := client.CreateTag(ctx, tagName)
+					if err != nil {
+						log.Warnf("Document %d: Failed to create new tag '%s': %v", documentID, tagName, err)
+						continue
+					}
+					log.Infof("Document %d: Created new tag '%s' with ID %d", documentID, tagName, newTagID)
+					availableTags[tagName] = newTagID
+					finalTagIDs = append(finalTagIDs, newTagID)
 				}
 			}
 			// Only update tags if there are remaining tags after changes
 			// Sending an empty tags array causes Paperless-NGX to return an error
 			// However, we need to track this for a potential second update
-			if len(newTagIDs) > 0 {
+			if len(finalTagIDs) > 0 {
 				originalFields["tags"] = originalDoc.Tags
-				updatedFields["tags"] = newTagIDs
+				updatedFields["tags"] = finalTagIDs
 			} else {
 				// Mark that we need to remove tags but can't do it in this update
 				// We'll handle this after the main update completes
@@ -501,6 +593,17 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 			}
 		}
 
+		// --- DOCUMENT TYPE ---
+		if document.SuggestedDocumentType != "" && document.SuggestedDocumentType != originalDoc.DocumentTypeName {
+			originalFields["document_type"] = originalDoc.DocumentTypeName
+			if docTypeID, exists := availableDocumentTypes[document.SuggestedDocumentType]; exists {
+				updatedFields["document_type"] = docTypeID
+			} else {
+				// Unlike correspondents, we don't create new document types - only use existing ones
+				log.Warnf("Document type '%s' not found in available types, skipping for document %d", document.SuggestedDocumentType, documentID)
+			}
+		}
+
 		// --- TITLE ---
 		suggestedTitle := document.SuggestedTitle
 		if len(suggestedTitle) > 128 {
@@ -514,12 +617,18 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 		// --- CREATED DATE ---
 		suggestedCreatedDate := document.SuggestedCreatedDate
 		if suggestedCreatedDate != "" {
-			// Validate format YYYY-MM-DD
-			if matched := regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`).MatchString(suggestedCreatedDate); matched {
+			// Validate that the date is a real Gregorian calendar date, not just
+			// a correctly-formatted string. time.Parse rejects impossible dates
+			// like "2023-01-79" (day 79) that the regex `^\d{4}-\d{2}-\d{2}$`
+			// would accept. Dropped pre-flight rather than after a 400 to avoid
+			// an unnecessary round-trip, but the effect on the user is the same:
+			// the field is skipped and the fail tag is applied.
+			if _, err := time.Parse("2006-01-02", suggestedCreatedDate); err == nil {
 				originalFields["created_date"] = document.OriginalDocument.CreatedDate
 				updatedFields["created_date"] = suggestedCreatedDate
 			} else {
-				log.Warnf("Invalid created_date format for document %d: %s. Expected YYYY-MM-DD, skipping.", documentID, suggestedCreatedDate)
+				log.Warnf("Document %d: created_date %q is not a valid calendar date, skipping. (%v)", documentID, suggestedCreatedDate, err)
+				partialDroppedFields = append(partialDroppedFields, "created_date")
 			}
 		}
 
@@ -539,7 +648,8 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 			case "replace":
 				finalCustomFields = []CustomFieldResponse{}
 				for _, sf := range document.SuggestedCustomFields {
-					finalCustomFields = append(finalCustomFields, CustomFieldResponse{Field: sf.ID, Value: sf.Value})
+					value := normalizeCustomFieldValue(customFieldTypes[sf.ID], sf.Value)
+					finalCustomFields = append(finalCustomFields, CustomFieldResponse{Field: sf.ID, Value: value})
 				}
 			case "update":
 				existingFieldsMap := make(map[int]*CustomFieldResponse)
@@ -547,10 +657,11 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 					existingFieldsMap[finalCustomFields[i].Field] = &finalCustomFields[i]
 				}
 				for _, sf := range document.SuggestedCustomFields {
+					value := normalizeCustomFieldValue(customFieldTypes[sf.ID], sf.Value)
 					if ef, ok := existingFieldsMap[sf.ID]; ok {
-						ef.Value = sf.Value
+						ef.Value = value
 					} else {
-						finalCustomFields = append(finalCustomFields, CustomFieldResponse{Field: sf.ID, Value: sf.Value})
+						finalCustomFields = append(finalCustomFields, CustomFieldResponse{Field: sf.ID, Value: value})
 					}
 				}
 			case "append":
@@ -560,7 +671,8 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 				}
 				for _, sf := range document.SuggestedCustomFields {
 					if _, exists := existingFieldsMap[sf.ID]; !exists {
-						finalCustomFields = append(finalCustomFields, CustomFieldResponse{Field: sf.ID, Value: sf.Value})
+						value := normalizeCustomFieldValue(customFieldTypes[sf.ID], sf.Value)
+						finalCustomFields = append(finalCustomFields, CustomFieldResponse{Field: sf.ID, Value: value})
 					}
 				}
 			}
@@ -575,10 +687,10 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 		if len(updatedFields) == 0 {
 			log.Infof("No fields to update for document %d.", documentID)
 			// Still need to remove the auto-tag if it exists
-			if slices.Contains(originalDoc.Tags, autoTag) || slices.Contains(originalDoc.Tags, manualTag) {
+			if slices.Contains(originalDoc.Tags, autoTag) || slices.Contains(originalDoc.Tags, manualTag) || slices.Contains(originalDoc.Tags, autoOcrTag) {
 				var finalTagIDs []int
 				for _, tagName := range originalDoc.Tags {
-					if !strings.EqualFold(tagName, autoTag) && !strings.EqualFold(tagName, manualTag) {
+					if !strings.EqualFold(tagName, autoTag) && !strings.EqualFold(tagName, manualTag) && !strings.EqualFold(tagName, autoOcrTag) {
 						if tagID, exists := availableTags[tagName]; exists {
 							finalTagIDs = append(finalTagIDs, tagID)
 						}
@@ -601,21 +713,77 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 		}
 
 		log.Debugf("Document %d: Fields to update: %v", documentID, updatedFields)
-		jsonData, err := json.Marshal(updatedFields)
-		if err != nil {
-			return fmt.Errorf("error marshalling JSON for document %d: %w", documentID, err)
-		}
 
-		path := fmt.Sprintf("api/documents/%d/", documentID)
-		resp, err := client.Do(ctx, "PATCH", path, bytes.NewBuffer(jsonData))
-		if err != nil {
-			return fmt.Errorf("error updating document %d: %w", documentID, err)
-		}
-		defer resp.Body.Close()
+		// PATCH with strip-and-retry: if paperless-ngx rejects the update with
+		// a 400 (e.g. an LLM-suggested value that fails server-side
+		// validation), parse the response to identify which fields paperless
+		// rejected, remove them from updatedFields, and retry. This salvages
+		// the valid fields the LLM suggested instead of discarding the entire
+		// update.
+		//
+		// In practice paperless-ngx reports all validation errors in a single
+		// 400 response, so one retry is normally sufficient. The retry cap
+		// guards against pathological cases (e.g. cascading validation).
+		// If after all retries we still cannot get a 200, the caller's
+		// recoverFromFailedUpdate handles the final loop-break (remove auto
+		// tag, add fail tag).
+		const maxRetries = 3
+		patchPath := fmt.Sprintf("api/documents/%d/", documentID)
+		patchSucceeded := false
 
-		if resp.StatusCode != http.StatusOK {
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			if len(updatedFields) == 0 {
+				// All fields stripped — nothing left to send.
+				return fmt.Errorf("error updating document %d: paperless-ngx rejected every field that was suggested (dropped on previous attempts: %v)", documentID, partialDroppedFields)
+			}
+
+			jsonData, err := json.Marshal(updatedFields)
+			if err != nil {
+				return fmt.Errorf("error marshalling JSON for document %d: %w", documentID, err)
+			}
+
+			resp, err := client.Do(ctx, "PATCH", patchPath, bytes.NewBuffer(jsonData))
+			if err != nil {
+				return fmt.Errorf("error updating document %d: %w", documentID, err)
+			}
 			bodyBytes, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("error updating document %d: %d, %s", documentID, resp.StatusCode, string(bodyBytes))
+			resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				patchSucceeded = true
+				break
+			}
+
+			if resp.StatusCode != http.StatusBadRequest {
+				return fmt.Errorf("error updating document %d: %d, %s", documentID, resp.StatusCode, string(bodyBytes))
+			}
+
+			// 400 — try to identify the failing fields so we can drop them and retry.
+			scalarFails, cfIdxFails, unrecoverable := parsePaperlessValidationErrors(bodyBytes)
+			if unrecoverable || (len(scalarFails) == 0 && len(cfIdxFails) == 0) {
+				return fmt.Errorf("error updating document %d: %d, %s", documentID, resp.StatusCode, string(bodyBytes))
+			}
+
+			newlyDropped := stripFailedFields(updatedFields, scalarFails, cfIdxFails)
+			if len(newlyDropped) == 0 {
+				// Paperless reported errors but they don't match anything in our
+				// current payload — defensive guard against parser/format drift.
+				return fmt.Errorf("error updating document %d: %d, %s", documentID, resp.StatusCode, string(bodyBytes))
+			}
+
+			partialDroppedFields = append(partialDroppedFields, newlyDropped...)
+			log.Warnf("Document %d: paperless-ngx rejected fields %v on attempt %d/%d; retrying without them. Raw response: %s", documentID, newlyDropped, attempt+1, maxRetries+1, string(bodyBytes))
+		}
+
+		if !patchSucceeded {
+			return fmt.Errorf("error updating document %d: paperless-ngx still rejected the update after %d retries (fields dropped so far: %v)", documentID, maxRetries, partialDroppedFields)
+		}
+
+		if len(partialDroppedFields) > 0 && firstPartial == nil {
+			firstPartial = &PartialUpdateError{
+				DocumentID:    documentID,
+				DroppedFields: partialDroppedFields,
+			}
 		}
 
 		// Check if we need to remove auto/manual tags in a separate update
@@ -635,7 +803,7 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 					var remainingTagIDs []int
 					var remainingTagNames []string
 					for _, tagName := range currentDoc.Tags {
-						if !strings.EqualFold(tagName, autoTag) && !strings.EqualFold(tagName, manualTag) {
+						if !strings.EqualFold(tagName, autoTag) && !strings.EqualFold(tagName, manualTag) && !strings.EqualFold(tagName, autoOcrTag) {
 							if tagID, exists := availableTags[tagName]; exists {
 								remainingTagIDs = append(remainingTagIDs, tagID)
 								remainingTagNames = append(remainingTagNames, tagName)
@@ -700,7 +868,100 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 		}
 		log.Printf("Document %d updated successfully.", documentID)
 	}
+	if firstPartial != nil {
+		return firstPartial
+	}
 	return nil
+}
+
+// parsePaperlessValidationErrors interprets paperless-ngx's 400 response body
+// and classifies the validation errors into three buckets:
+//   - scalarFields: top-level fields (other than custom_fields and tags) that
+//     paperless rejected. These can be removed from the PATCH and retried.
+//   - customFieldIndices: indices into the custom_fields array whose entries
+//     paperless rejected. These entries can be removed and retried.
+//   - unrecoverable: true if the response contains errors paperless-gpt cannot
+//     safely drop (currently: any failure that references the "tags" field,
+//     because the tag update is what breaks the auto-processing loop). The
+//     caller must treat this as a hard failure.
+//
+// Returns (nil, nil, false) if the body cannot be parsed as the expected
+// shape; the caller treats this as a hard failure too.
+//
+// Example paperless-ngx 400 body this parser handles:
+//
+//	{"created_date":["Date has wrong format..."],
+//	 "custom_fields":[{},{},{},{},{},{"non_field_errors":["..."]},{},{}]}
+func parsePaperlessValidationErrors(body []byte) (scalarFields map[string]bool, customFieldIndices []int, unrecoverable bool) {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, nil, false
+	}
+	scalarFields = make(map[string]bool)
+	for key, val := range raw {
+		switch key {
+		case "tags":
+			// Tag updates are load-bearing for the loop-break behaviour; we
+			// must not drop them silently. Treat as unrecoverable so the
+			// caller falls back to recoverFromFailedUpdate.
+			unrecoverable = true
+			return
+		case "custom_fields":
+			arr, ok := val.([]any)
+			if !ok {
+				// Unexpected shape — bail to hard-failure path.
+				unrecoverable = true
+				return
+			}
+			for i, entry := range arr {
+				obj, ok := entry.(map[string]any)
+				if !ok || len(obj) == 0 {
+					continue
+				}
+				customFieldIndices = append(customFieldIndices, i)
+			}
+		default:
+			scalarFields[key] = true
+		}
+	}
+	if len(scalarFields) == 0 && len(customFieldIndices) == 0 {
+		return nil, nil, false
+	}
+	return scalarFields, customFieldIndices, false
+}
+
+// stripFailedFields removes the fields named in scalarFields and the
+// custom_fields entries at the given indices from updatedFields, in-place.
+// Returns human-readable names of fields actually stripped, for logging.
+func stripFailedFields(updatedFields map[string]interface{}, scalarFields map[string]bool, customFieldIndices []int) []string {
+	var dropped []string
+	for field := range scalarFields {
+		if _, present := updatedFields[field]; present {
+			delete(updatedFields, field)
+			dropped = append(dropped, field)
+		}
+	}
+	if len(customFieldIndices) > 0 {
+		if cf, ok := updatedFields["custom_fields"].([]CustomFieldResponse); ok {
+			// Remove in descending index order so later indices remain valid
+			// as we splice the slice.
+			sortedIdx := slices.Clone(customFieldIndices)
+			sort.Sort(sort.Reverse(sort.IntSlice(sortedIdx)))
+			for _, idx := range sortedIdx {
+				if idx < 0 || idx >= len(cf) {
+					continue
+				}
+				dropped = append(dropped, fmt.Sprintf("custom_fields[%d](field_id=%d)", idx, cf[idx].Field))
+				cf = append(cf[:idx], cf[idx+1:]...)
+			}
+			if len(cf) == 0 {
+				delete(updatedFields, "custom_fields")
+			} else {
+				updatedFields["custom_fields"] = cf
+			}
+		}
+	}
+	return dropped
 }
 
 // DownloadDocumentAsImages downloads the PDF file of the specified document and converts it to images
@@ -784,11 +1045,7 @@ func (client *PaperlessClient) DownloadDocumentAsImages(ctx context.Context, doc
 		n := n // capture loop variable
 		g.Go(func() error {
 			// DPI calculation constants
-			const minDPI = 72                     // Minimum DPI to ensure readable text
-			const maxPixelDimension = 10_000      // Maximum pixels along any side (10,000px)
-			const maxTotalPixels = 40_000_000     // Maximum total pixel count (40 megapixels)
-			const maxRenderDPI = 600              // Maximum DPI to use when rendering
-			const maxFileBytes = 10 * 1024 * 1024 // Maximum JPEG file size (10 MB)
+			const minDPI = 72 // Minimum DPI to ensure readable text
 
 			mu.Lock() // MuPDF is not thread-safe
 			rect, err := doc.Bound(n)
@@ -802,14 +1059,14 @@ func (client *PaperlessClient) DownloadDocumentAsImages(ctx context.Context, doc
 			hPts := float64(rect.Dy())
 
 			// Calculate DPI limits based on maximum allowed dimension and total pixels
-			dpiSide := float64(maxPixelDimension*72) / math.Max(wPts, hPts)
-			dpiArea := math.Sqrt(float64(maxTotalPixels) * 72 * 72 / (wPts * hPts))
+			dpiSide := float64(imageMaxPixelDimension*72) / math.Max(wPts, hPts)
+			dpiArea := math.Sqrt(float64(imageMaxTotalPixels) * 72 * 72 / (wPts * hPts))
 
 			// Use the more restrictive of the two limits
 			dpi := math.Min(dpiSide, dpiArea)
 
 			// Ensure DPI stays within acceptable bounds
-			dpi = math.Min(dpi, float64(maxRenderDPI))
+			dpi = math.Min(dpi, float64(imageMaxRenderDPI))
 			dpi = math.Max(dpi, float64(minDPI))
 
 			// Render the page at calculated DPI
@@ -828,7 +1085,7 @@ func (client *PaperlessClient) DownloadDocumentAsImages(ctx context.Context, doc
 
 			// Try moderate quality reduction first to avoid OCR-affecting artifacts
 			// More granular steps (85, 80, 75, 70, 65, 60)
-			for q := 85; buf.Len() > maxFileBytes && q >= 60; q -= 5 {
+			for q := 85; buf.Len() > imageMaxFileBytes && q >= 60; q -= 5 {
 				buf.Reset()
 				if err := jpeg.Encode(buf, img, &jpeg.Options{Quality: q}); err != nil {
 					return err
@@ -836,9 +1093,9 @@ func (client *PaperlessClient) DownloadDocumentAsImages(ctx context.Context, doc
 			}
 
 			// If quality reduction wasn't enough, resize the image as last resort
-			if buf.Len() > maxFileBytes {
+			if buf.Len() > imageMaxFileBytes {
 				// Calculate precise scale factor needed to meet file size target
-				scale := math.Sqrt(float64(maxFileBytes) / float64(buf.Len()))
+				scale := math.Sqrt(float64(imageMaxFileBytes) / float64(buf.Len()))
 
 				// Resize image proportionally using high-quality Lanczos algorithm
 				img = imaging.Resize(img,
@@ -850,6 +1107,8 @@ func (client *PaperlessClient) DownloadDocumentAsImages(ctx context.Context, doc
 					return err
 				}
 			}
+
+			log.Infof("Document %d page %d: final image dimensions %dx%d, size %d bytes, DPI %.0f", documentID, n, img.Bounds().Dx(), img.Bounds().Dy(), buf.Len(), dpi)
 
 			// Save image to file
 			imagePath := filepath.Join(docDir, fmt.Sprintf("page%03d.jpg", n))
@@ -1296,6 +1555,27 @@ func (client *PaperlessClient) CreateTag(ctx context.Context, tagName string) (i
 	}
 
 	return createdTag.ID, nil
+}
+
+// EnsureTagExists checks whether a tag with the given name exists in paperless-ngx
+// and creates it if not. Used for paperless-gpt's internal marker tags (e.g. failTag)
+// which should always be available regardless of the CREATE_NEW_TAGS setting,
+// because they are not LLM-suggested tags but mechanically applied by paperless-gpt itself.
+func (client *PaperlessClient) EnsureTagExists(ctx context.Context, tagName string) error {
+	if tagName == "" {
+		return nil
+	}
+	tags, err := client.GetAllTags(ctx)
+	if err != nil {
+		return fmt.Errorf("error fetching tags: %w", err)
+	}
+	if _, exists := tags[tagName]; exists {
+		return nil
+	}
+	if _, err := client.CreateTag(ctx, tagName); err != nil {
+		return fmt.Errorf("error creating tag %q: %w", tagName, err)
+	}
+	return nil
 }
 
 // UploadDocument uploads a document to paperless-ngx

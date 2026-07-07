@@ -18,11 +18,12 @@ import (
 
 // ProcessedDocument represents a document after OCR processing
 type ProcessedDocument struct {
-	ID         int
-	Text       string
-	HOCRStruct *hocr.HOCR
-	HOCR       string
-	PDFData    []byte
+	ID               int
+	Text             string
+	HOCRStruct       *hocr.HOCR
+	HOCR             string
+	PDFData          []byte
+	ReplacedOriginal bool // true when the original document was successfully deleted and replaced
 }
 
 // HOCRCapable defines an interface for OCR providers that can generate hOCR
@@ -52,6 +53,16 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 		docLogger = docLogger.WithField("job_id", jobID)
 	}
 	docLogger.Info("Starting OCR processing")
+
+	// Render OCR prompt per-document with existing content (same pattern as title/tag/etc. prompts).
+	// Use a call-scoped provider clone to avoid mutating the shared singleton.
+	provider := app.ocrProvider
+	ocrPrompt, err := renderOCRPrompt(options.ExistingContent)
+	if err != nil {
+		docLogger.WithError(err).Warn("Failed to render per-document OCR prompt, using provider default")
+	} else if llmProv, ok := provider.(*ocr.LLMProvider); ok {
+		provider = llmProv.WithPrompt(ocrPrompt)
+	}
 
 	// Determine the actual process mode to use
 	processMode := options.ProcessMode
@@ -114,7 +125,7 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 	var hocrCapable HOCRCapable
 	var hasHOCR bool
 
-	hocrCapable, hasHOCR = app.ocrProvider.(HOCRCapable)
+	hocrCapable, hasHOCR = provider.(HOCRCapable)
 
 	// Reset hOCR if the provider supports it
 	if hasHOCR {
@@ -145,7 +156,8 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 	if processMode == "whole_pdf" {
 		// Process the entire PDF in one go, skipping the splitting step
 		var pdfBytes []byte
-		_, pdfBytes, totalPdfPages, err := app.Client.DownloadDocumentAsPDF(ctx, documentID, 0, false)
+		var err error
+		_, pdfBytes, totalPdfPages, err = app.Client.DownloadDocumentAsPDF(ctx, documentID, 0, false)
 		if err != nil {
 			return nil, fmt.Errorf("error downloading document PDF for document %d: %w", documentID, err)
 		}
@@ -159,7 +171,7 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 		}).Debug("Processing whole PDF document")
 
 		// Process the whole PDF in one go
-		result, err := app.ocrProvider.ProcessImage(ctx, originalPDFData, 0) // Page 0 indicates entire document
+		result, err := provider.ProcessImage(ctx, originalPDFData, 0) // Page 0 indicates entire document
 		if err != nil {
 			return nil, fmt.Errorf("error performing OCR for document %d: %w", documentID, err)
 		}
@@ -217,7 +229,7 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 			}
 
 			// Pass the page number (1-based index) to ProcessImage
-			result, err := app.ocrProvider.ProcessImage(ctx, pdfContent, i+1)
+			result, err := provider.ProcessImage(ctx, pdfContent, i+1)
 			if err != nil {
 				return nil, fmt.Errorf("error performing OCR for document %d, page %d: %w", documentID, i+1, err)
 			}
@@ -287,7 +299,7 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 			imageDataList = append(imageDataList, imageContent)
 
 			// Pass the page number (1-based index) to ProcessImage
-			result, err := app.ocrProvider.ProcessImage(ctx, imageContent, i+1)
+			result, err := provider.ProcessImage(ctx, imageContent, i+1)
 			if err != nil {
 				return nil, fmt.Errorf("error performing OCR for document %d, page %d: %w", documentID, i+1, err)
 			}
@@ -381,18 +393,26 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 						var pdfData []byte
 						var err error
 
-						// For both "pdf" and "whole_pdf" modes, use ApplyOCR with original PDF data
-						if (processMode == "pdf" || processMode == "whole_pdf") && originalPDFData != nil {
-							docLogger.Debug("Using ApplyOCR with original PDF data")
-							pdfData, err = pdfocr.ApplyOCR(originalPDFData, hocrDoc, pdfConfig)
-						} else if len(imageDataList) > 0 {
-							// Only for "image" mode, use AssembleWithOCR with image data
-							docLogger.Debug("Using AssembleWithOCR with image data")
-							pdfData, err = pdfocr.AssembleWithOCR(hocrDoc, imageDataList, pdfConfig)
-						} else {
-							docLogger.Error("No suitable data available for PDF generation")
-							err = fmt.Errorf("no suitable data available for PDF generation")
+						// For both "pdf" and "whole_pdf" modes, use ApplyOCR with original PDF data.
+						// pdfocr.ApplyOCR transitively calls into gofpdi which can panic on
+						// malformed PDFs (#945). Recover so the worker keeps draining the queue.
+						applyOCR := func() (data []byte, err error) {
+							defer func() {
+								if r := recover(); r != nil {
+									err = fmt.Errorf("apply OCR panicked: %v", r)
+								}
+							}()
+							if (processMode == "pdf" || processMode == "whole_pdf") && originalPDFData != nil {
+								docLogger.Debug("Using ApplyOCR with original PDF data")
+								return pdfocr.ApplyOCR(originalPDFData, hocrDoc, pdfConfig)
+							}
+							if len(imageDataList) > 0 {
+								docLogger.Debug("Using AssembleWithOCR with image data")
+								return pdfocr.AssembleWithOCR(hocrDoc, imageDataList, pdfConfig)
+							}
+							return nil, fmt.Errorf("no suitable data available for PDF generation")
 						}
+						pdfData, err = applyOCR()
 
 						if err != nil {
 							docLogger.WithError(err).Error("Failed to apply OCR to PDF")
@@ -411,6 +431,8 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 							if options.UploadPDF && pdfData != nil {
 								if err := app.uploadProcessedPDF(ctx, documentID, pdfData, options, docLogger); err != nil {
 									docLogger.WithError(err).Error("Failed to upload processed PDF")
+								} else if options.ReplaceOriginal {
+									processedDoc.ReplacedOriginal = true
 								}
 							}
 						}

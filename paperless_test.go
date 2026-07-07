@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"testing"
 
@@ -184,8 +185,48 @@ func TestGetAllTags(t *testing.T) {
 	assert.Equal(t, expectedTags, tags)
 }
 
-// TestGetDocumentsByTags tests the GetDocumentsByTags method
-func TestGetDocumentsByTags(t *testing.T) {
+// TestGetDocumentCountByTag tests the GetDocumentCountByTag method
+func TestGetDocumentCountByTag(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.teardown()
+
+	// Mock data for paginated responses
+	data1 := map[string]interface{}{
+		"count": 1,
+		"results": []map[string]interface{}{
+			{"document_count": 5},
+		},
+	}
+
+	data2 := map[string]interface{}{
+		"count":   0,
+		"results": []map[string]interface{}{},
+	}
+
+	// Set mock responses for pagination
+	env.setMockResponse("/api/tags/", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("name__iexact")
+		if query == "available" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(data1)
+		} else {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(data2)
+		}
+	})
+
+	ctx := context.Background()
+	countAvailable, err := env.client.GetDocumentCountByTag(ctx, "available")
+	require.NoError(t, err)
+	assert.Equal(t, 5, countAvailable)
+
+	countNotAvailable, err := env.client.GetDocumentCountByTag(ctx, "notavailable")
+	require.NoError(t, err)
+	assert.Equal(t, 0, countNotAvailable)
+}
+
+// TestGetDocumentsByTag tests the GetDocumentsByTag method
+func TestGetDocumentsByTag(t *testing.T) {
 	env := newTestEnv(t)
 	defer env.teardown()
 
@@ -221,23 +262,38 @@ func TestGetDocumentsByTags(t *testing.T) {
 		"next": nil,
 	}
 
+	// Mock data for tags
+	tagsExactResponse := map[string]interface{}{
+		"results": []map[string]interface{}{
+			{"document_count": 2},
+		},
+		"count": 1,
+	}
+
 	// Set mock responses
 	env.setMockResponse("/api/documents/", func(w http.ResponseWriter, r *http.Request) {
 		// Verify query parameters
-		expectedQuery := "tags__name__iexact=tag1&tags__name__iexact=tag2&page_size=25"
+		expectedQuery := "tags__name__iexact=tag2&page_size=25"
 		assert.Equal(t, expectedQuery, r.URL.RawQuery)
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(documentsResponse)
 	})
 
 	env.setMockResponse("/api/tags/", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(tagsResponse)
+		// Handle GetDocumentCountByTag call
+		if nameFilter := r.URL.Query().Get("name__iexact"); nameFilter != "" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(tagsExactResponse)
+		} else {
+			// Handle GetAllTags call
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(tagsResponse)
+		}
 	})
 
 	ctx := context.Background()
-	tags := []string{"tag1", "tag2"}
-	documents, err := env.client.GetDocumentsByTags(ctx, tags, 25)
+	tag := "tag2"
+	documents, err := env.client.GetDocumentsByTag(ctx, tag, 25)
 	require.NoError(t, err)
 
 	expectedDocuments := []Document{
@@ -256,6 +312,83 @@ func TestGetDocumentsByTags(t *testing.T) {
 			Tags:          []string{"tag2", "tag3"},
 			Correspondent: "Beta",
 			CreatedDate:   "1999-09-02",
+		},
+	}
+
+	assert.Equal(t, expectedDocuments, documents)
+}
+
+// TestGetDocumentsByTagWithEmoji tests the GetDocumentsByTag method with emoji and special characters
+func TestGetDocumentsByTagWithEmoji(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.teardown()
+
+	// Mock data for documents
+	documentsResponse := GetDocumentsApiResponse{
+		Results: []GetDocumentApiResponseResult{
+			{
+				ID:            1,
+				Title:         "AI Document",
+				Content:       "Content about AI",
+				Tags:          []int{1},
+				Correspondent: 1,
+				CreatedDate:   "2024-01-01",
+			},
+		},
+	}
+
+	// Mock data for tags
+	tagsResponse := map[string]interface{}{
+		"results": []map[string]interface{}{
+			{"id": 1, "name": "🤖 AI-Queue"},
+		},
+		"next": nil,
+	}
+
+	// Mock data for exact tag match
+	tagsExactResponse := map[string]interface{}{
+		"results": []map[string]interface{}{
+			{"document_count": 1},
+		},
+		"count": 1,
+	}
+
+	// Set mock responses
+	env.setMockResponse("/api/documents/", func(w http.ResponseWriter, r *http.Request) {
+		// Verify query parameters - the tag should be URL-encoded
+		expectedQuery := fmt.Sprintf("tags__name__iexact=%s&page_size=25", url.QueryEscape("🤖 AI-Queue"))
+		assert.Equal(t, expectedQuery, r.URL.RawQuery)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(documentsResponse)
+	})
+
+	env.setMockResponse("/api/tags/", func(w http.ResponseWriter, r *http.Request) {
+		// Handle GetDocumentCountByTag call
+		if nameFilter := r.URL.Query().Get("name__iexact"); nameFilter != "" {
+			// Verify the decoded value matches our emoji tag
+			assert.Equal(t, "🤖 AI-Queue", nameFilter)
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(tagsExactResponse)
+		} else {
+			// Handle GetAllTags call
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(tagsResponse)
+		}
+	})
+
+	ctx := context.Background()
+	tag := "🤖 AI-Queue"
+	documents, err := env.client.GetDocumentsByTag(ctx, tag, 25)
+	require.NoError(t, err)
+
+	expectedDocuments := []Document{
+		{
+			ID:            1,
+			Title:         "AI Document",
+			Content:       "Content about AI",
+			Tags:          []string{"🤖 AI-Queue"},
+			Correspondent: "Alpha",
+			CreatedDate:   "2024-01-01",
 		},
 	}
 
@@ -373,8 +506,12 @@ func TestUpdateDocuments(t *testing.T) {
 //     then remove the manual tag in a separate call
 //  2. Document has only the manual tag with NO other changes - should skip the update entirely
 func TestUpdateDocuments_RemovingLastTag(t *testing.T) {
-	// Set the manual tag for this test
+	// in this scenario, the manualTag is set, but the
+	// document processing sends both the auto and manual
+	// versions of the tag to be removed. this is why you'll
+	// see the autoTag included in the RemoveTags but not in the original document.
 	manualTag = "paperless-gpt"
+	autoTag = "paperless-gpt-auto"
 
 	tests := []struct {
 		name              string
@@ -389,12 +526,12 @@ func TestUpdateDocuments_RemovingLastTag(t *testing.T) {
 				OriginalDocument: Document{
 					ID:          1,
 					Title:       "Old Title",
-					Tags:        []string{"paperless-gpt"},
+					Tags:        []string{manualTag},
 					CreatedDate: "1999-09-01",
 				},
 				SuggestedTitle: "New Title",
 				SuggestedTags:  []string{},
-				RemoveTags:     []string{},
+				RemoveTags:     []string{manualTag, autoTag},
 			},
 			expectUpdateCalls: 2,
 			validateCalls: func(t *testing.T, calls []map[string]interface{}) {
@@ -417,12 +554,12 @@ func TestUpdateDocuments_RemovingLastTag(t *testing.T) {
 				OriginalDocument: Document{
 					ID:          2,
 					Title:       "Same Title",
-					Tags:        []string{"paperless-gpt"},
+					Tags:        []string{manualTag},
 					CreatedDate: "1999-09-01",
 				},
 				SuggestedTitle: "",
 				SuggestedTags:  []string{},
-				RemoveTags:     []string{},
+				RemoveTags:     []string{manualTag, autoTag},
 			},
 			expectUpdateCalls: 1,
 			validateCalls: func(t *testing.T, calls []map[string]interface{}) {
@@ -618,4 +755,186 @@ func TestDownloadDocumentAsPDF(t *testing.T) {
 	assert.Equal(t, 1, totalPages)
 
 	// Testing with splitting=true would be more complex so we'll skip that for simplicity
+}
+
+func TestParsePaperlessValidationErrors(t *testing.T) {
+	t.Run("real-world response with created_date + one custom_field", func(t *testing.T) {
+		body := []byte(`{"created_date":["Date has wrong format. Use one of these formats instead: YYYY-MM-DD."],"custom_fields":[{},{},{},{},{},{},{},{"non_field_errors":["Date has wrong format. Use one of these formats instead: YYYY-MM-DD."]}]}`)
+		scalars, cfIdx, unrecoverable := parsePaperlessValidationErrors(body)
+		require.False(t, unrecoverable)
+		assert.True(t, scalars["created_date"], "created_date must be reported")
+		assert.Equal(t, []int{7}, cfIdx, "custom_fields[7] is the only failing entry")
+	})
+
+	t.Run("only custom_field failure", func(t *testing.T) {
+		body := []byte(`{"custom_fields":[{},{"non_field_errors":["bad"]},{}]}`)
+		scalars, cfIdx, unrecoverable := parsePaperlessValidationErrors(body)
+		require.False(t, unrecoverable)
+		assert.Empty(t, scalars)
+		assert.Equal(t, []int{1}, cfIdx)
+	})
+
+	t.Run("only scalar failure", func(t *testing.T) {
+		body := []byte(`{"title":["This field may not be blank."]}`)
+		scalars, cfIdx, unrecoverable := parsePaperlessValidationErrors(body)
+		require.False(t, unrecoverable)
+		assert.True(t, scalars["title"])
+		assert.Empty(t, cfIdx)
+	})
+
+	t.Run("tags failure is unrecoverable", func(t *testing.T) {
+		// Tag updates carry the loop-break (auto-tag removal). We must not
+		// silently drop them.
+		body := []byte(`{"tags":["Invalid pk \"99\" - object does not exist."]}`)
+		_, _, unrecoverable := parsePaperlessValidationErrors(body)
+		assert.True(t, unrecoverable, "tag errors must be classified as unrecoverable")
+	})
+
+	t.Run("garbage body returns nothing-to-strip", func(t *testing.T) {
+		scalars, cfIdx, unrecoverable := parsePaperlessValidationErrors([]byte("not json"))
+		assert.Nil(t, scalars)
+		assert.Nil(t, cfIdx)
+		assert.False(t, unrecoverable)
+	})
+
+	t.Run("empty response with no errors returns nothing-to-strip", func(t *testing.T) {
+		scalars, cfIdx, unrecoverable := parsePaperlessValidationErrors([]byte(`{}`))
+		assert.Nil(t, scalars)
+		assert.Nil(t, cfIdx)
+		assert.False(t, unrecoverable)
+	})
+}
+
+func TestStripFailedFields(t *testing.T) {
+	t.Run("strips scalar field", func(t *testing.T) {
+		uf := map[string]interface{}{
+			"title":        "BARMER letter",
+			"created_date": "2023-01-79",
+		}
+		dropped := stripFailedFields(uf, map[string]bool{"created_date": true}, nil)
+		assert.Equal(t, []string{"created_date"}, dropped)
+		_, present := uf["created_date"]
+		assert.False(t, present)
+		assert.Equal(t, "BARMER letter", uf["title"])
+	})
+
+	t.Run("strips custom_fields entries by index, preserves the rest", func(t *testing.T) {
+		uf := map[string]interface{}{
+			"custom_fields": []CustomFieldResponse{
+				{Field: 6, Value: "Adresse"},
+				{Field: 7, Value: "2023-01-79"},
+				{Field: 8, Value: "M976605823"},
+			},
+		}
+		dropped := stripFailedFields(uf, nil, []int{1})
+		require.Len(t, dropped, 1)
+		assert.Contains(t, dropped[0], "field_id=7")
+		cf := uf["custom_fields"].([]CustomFieldResponse)
+		require.Len(t, cf, 2)
+		assert.Equal(t, 6, cf[0].Field)
+		assert.Equal(t, 8, cf[1].Field, "field 8 must remain after deleting index 1")
+	})
+
+	t.Run("strips multiple custom_fields entries (descending order is safe)", func(t *testing.T) {
+		uf := map[string]interface{}{
+			"custom_fields": []CustomFieldResponse{
+				{Field: 1, Value: "a"},
+				{Field: 2, Value: "b"},
+				{Field: 3, Value: "c"},
+				{Field: 4, Value: "d"},
+			},
+		}
+		dropped := stripFailedFields(uf, nil, []int{0, 2})
+		require.Len(t, dropped, 2)
+		cf := uf["custom_fields"].([]CustomFieldResponse)
+		require.Len(t, cf, 2)
+		assert.Equal(t, 2, cf[0].Field, "field 2 must remain after deleting indices 0 and 2")
+		assert.Equal(t, 4, cf[1].Field, "field 4 must remain after deleting indices 0 and 2")
+	})
+
+	t.Run("removes custom_fields key entirely if all entries fail", func(t *testing.T) {
+		uf := map[string]interface{}{
+			"title": "Letter",
+			"custom_fields": []CustomFieldResponse{
+				{Field: 7, Value: "2023-01-79"},
+			},
+		}
+		dropped := stripFailedFields(uf, nil, []int{0})
+		require.Len(t, dropped, 1)
+		_, present := uf["custom_fields"]
+		assert.False(t, present, "custom_fields key should be removed when empty")
+		assert.Equal(t, "Letter", uf["title"])
+	})
+
+	t.Run("ignores out-of-range custom_field indices", func(t *testing.T) {
+		uf := map[string]interface{}{
+			"custom_fields": []CustomFieldResponse{{Field: 1, Value: "a"}},
+		}
+		dropped := stripFailedFields(uf, nil, []int{5})
+		assert.Empty(t, dropped)
+		cf := uf["custom_fields"].([]CustomFieldResponse)
+		assert.Len(t, cf, 1, "original entry must remain when index is out of range")
+	})
+
+	t.Run("returns empty when scalar field is not in payload", func(t *testing.T) {
+		uf := map[string]interface{}{"title": "x"}
+		dropped := stripFailedFields(uf, map[string]bool{"created_date": true}, nil)
+		assert.Empty(t, dropped, "must not report a drop for a field that was not in the payload")
+		assert.Equal(t, "x", uf["title"])
+	})
+}
+
+func TestCreatedDatePreValidation(t *testing.T) {
+	// Verify that UpdateDocuments rejects impossible dates like "2023-01-79"
+	// before sending the PATCH, so the bad date never reaches paperless-ngx.
+	// The field should appear in partialDroppedFields so the caller applies
+	// the fail tag.
+	env := setupTest(t)
+	defer env.teardown()
+
+	ctx := context.Background()
+
+	setupTestCase(TestCase{
+		name: "pre-validate created_date",
+		documents: []TestDocument{
+			{ID: 1, Title: "Test Doc", Tags: []string{autoTag}},
+		},
+	}, env)
+
+	patchCalled := false
+	var receivedPatch map[string]interface{}
+	env.setMockResponse("/api/documents/1/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			json.NewEncoder(w).Encode(GetDocumentApiResponse{
+				ID: 1, Title: "Test Doc", Tags: []int{1}, Content: "content",
+			})
+			return
+		}
+		if r.Method == "PATCH" {
+			patchCalled = true
+			json.NewDecoder(r.Body).Decode(&receivedPatch)
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"id": 1, "title": "Test Doc", "tags": []int{1},
+			})
+		}
+	})
+
+	suggestion := DocumentSuggestion{
+		ID:                   1,
+		OriginalDocument:     Document{ID: 1, Title: "Test Doc", Tags: []string{autoTag}},
+		SuggestedTitle:       "Better Title",
+		SuggestedCreatedDate: "2023-01-79", // impossible date
+	}
+
+	err := env.client.UpdateDocuments(ctx, []DocumentSuggestion{suggestion}, env.db, false)
+
+	var partial *PartialUpdateError
+	require.ErrorAs(t, err, &partial, "UpdateDocuments must return PartialUpdateError when created_date is invalid")
+	assert.Contains(t, partial.DroppedFields, "created_date", "created_date must be in DroppedFields")
+	require.True(t, patchCalled, "PATCH must still be sent (with the valid fields)")
+	if created, ok := receivedPatch["created_date"]; ok {
+		t.Errorf("PATCH must not include invalid created_date, but got %v", created)
+	}
+	assert.Equal(t, "Better Title", receivedPatch["title"], "valid fields must still be sent")
 }
